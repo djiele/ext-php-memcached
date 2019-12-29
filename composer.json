@@ -1,0 +1,30 @@
+{
+    "name": "djiele/ext-php-memcached",
+    "description": "Emulation of memcached php extension",
+    "type": "library",
+    "keywords": [
+        "firebase", "memcached", "extension", "cache", "memcache"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "djiele",
+            "homepage": "https://www.djiele.net"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "ext-sockets": "*",
+        "ext-json": "*",
+        "ext-igbinary": "*",
+        "ext-msgpack": "*",
+        "ext-fastlz": "*",
+        "ext-zlib": "*",
+        "flexihash/flexihash": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Djiele\\": "src/Djiele/"
+        }
+    }
+}
