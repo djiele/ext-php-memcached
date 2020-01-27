@@ -1,5 +1,5 @@
 # Memcached
-This library is a native PHP emulation of memcached php extension. The MemcachedClient class implements all of the Memcached ASCII protocol (but not the meta commands yet).
+This library is a native PHP emulation of memcached PHP extension. The MemcachedClient class implements all of the Memcached ASCII protocol (but not the meta commands yet).
 
 Note for windows users: this library makes use of few PHP extensions (igbinary, msgpack, fastlz). Although these extensions are not mandatory, they should be used to reproduce the default configuration of the php_memcached extension.
 
