@@ -3,11 +3,15 @@
 
 namespace Djiele\Memcached\Compressor;
 
+use Djiele\Memcached\Exception;
 
 class GzCompressor implements ICompressor
 {
     public function compress($data, array $options = [])
     {
+        if(! function_exists('gzcompress')) {
+            throw new ConfigurationException('Module "zlib" is not installed');
+        }
         if (isset($options['level'])) {
             $level = $options['level'];
         } else {
@@ -24,6 +28,9 @@ class GzCompressor implements ICompressor
 
     public function decompress($data)
     {
+        if(! function_exists('gzuncompress')) {
+            throw new ConfigurationException('Module "zlib" is not installed');
+        }
         return gzuncompress($data);
     }
 }

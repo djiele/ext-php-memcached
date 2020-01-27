@@ -2,12 +2,15 @@
 
 namespace Djiele\Memcached;
 
+use Djiele\Memcached\Exception\CommandNotFoundException;
+use Djiele\Memcached\Exception\SocketReadException;
 use Djiele\Memcached\Compressor\FastlzCompressor;
 use Djiele\Memcached\Compressor\GzCompressor;
 use Djiele\Memcached\Serializer\IgbinarySerializer;
 use Djiele\Memcached\Serializer\JsonSerializer;
 use Djiele\Memcached\Serializer\MsgpackSerializer;
 use Djiele\Memcached\Serializer\PhpSerializer;
+use Djiele\Memcached\Sasl\SaslAuthDigestMd5;
 
 class MemcachedClient
 {
@@ -25,6 +28,7 @@ class MemcachedClient
     protected $maxAllowableMem = 512;
     protected $maxIntLen = 10;
     protected $options = [
+        Memcached::OPT_BINARY_PROTOCOL => false,
         Memcached::OPT_NO_BLOCK => true,
         Memcached::OPT_TCP_NODELAY => false,
         Memcached::OPT_CONNECT_TIMEOUT => 10,
@@ -33,8 +37,15 @@ class MemcachedClient
         Memcached::OPT_COMPRESSION_THRESHOLD => 2000,
         Memcached::OPT_COMPRESSION_TYPE => Memcached::COMPRESSION_FASTLZ,
         Memcached::OPT_SERIALIZER => Memcached::SERIALIZER_IGBINARY,
+        Memcached::OPT_SASL_AUTH_METHOD => Memcached::SASL_AUTH_NONE,
         Memcached::OPT_PREFIX_KEY => '',
     ];
+    protected $serverVersion = null;
+    protected $saslMechsList = null;
+    protected $username = null;
+    protected $password = null;
+    protected $authenticated = false;
+    protected $authenticating = false;
 
     /**
      * MemcachedClient constructor.
@@ -92,18 +103,16 @@ class MemcachedClient
             $this->setOption($key, $value);
         }
     }
-
     /**
-     * Connect to memcache server
-     * @return bool
+     * Open TCP connection to memcache server
+     * @return mixed resource|bool
      */
-    public function connect()
-    {
+    protected function tcpConnection() {
         if (is_resource($this->conn)) {
             $this->lastErrNo = Memcached::RES_SUCCESS;
             $this->lastErrMsg = "Connected to {$this->host}:{$this->port}.";
 
-            return true;
+            return $this->conn;
         }
         $this->conn = @fsockopen(
             $this->host,
@@ -113,38 +122,64 @@ class MemcachedClient
             $this->options[Memcached::OPT_CONNECT_TIMEOUT]
         );
 
-
        if (is_resource($this->conn)) {
-           stream_set_blocking ($this->conn, $this->options[Memcached::OPT_NO_BLOCK]);
-           stream_context_set_option (
-               $this->conn,
-               ['socket' => ['tcp_nodelay' => $this->options[Memcached::OPT_TCP_NODELAY]]]
-           );
-           $this->lastErrNo = Memcached::RES_SUCCESS;;
-           $this->lastErrMsg = "Connected to {$this->host}:{$this->port}.";
+            stream_set_blocking ($this->conn, $this->options[Memcached::OPT_NO_BLOCK] ? false : true);
+            stream_context_set_option(
+                $this->conn,
+                ['socket' => ['tcp_nodelay' => $this->options[Memcached::OPT_TCP_NODELAY]]]
+            );
+            $this->lastErrNo = Memcached::RES_SUCCESS;
+            $this->lastErrMsg = "Connected to {$this->host}:{$this->port}.";
 
-           return true;
-       }  else {
-           switch ($this->lastErrNo) {
-               case SOCKET_ECONNREFUSED:
-                   $this->lastErrNo = MEMCACHED::RES_CONNECTION_SOCKET_CREATE_FAILURE;
-                   $this->lastErrMsg = "Connection to {$this->host}:{$this->port} failed.";
-                   break;
-               case SOCKET_ETIMEDOUT:
-                   $this->lastErrNo = MEMCACHED::RES_TIMEOUT;
-                   $this->lastErrMsg = "Connection to {$this->host}:{$this->port} timed out.";
-                   break;
-               case SOCKET_EHOSTUNREACH:
-                   $this->lastErrNo = MEMCACHED::RES_HOST_LOOKUP_FAILURE;
-                   $this->lastErrMsg = "No route to {$this->host}:{$this->port}.";
-                   break;
-               default:
-                   $this->lastErrMsg = "unknown error {$this->lastErrNo}. Connection to {$this->host}:{$this->port} failed.";
-           }
-           trigger_error("Connection to {$this->host}:{$this->port} failed.", E_USER_NOTICE);
+            return $this->conn;
+        } else {
+            switch ($this->lastErrNo) {
+                case SOCKET_ECONNREFUSED:
+                    $this->lastErrNo = MEMCACHED::RES_CONNECTION_SOCKET_CREATE_FAILURE;
+                    $this->lastErrMsg = "Connection to {$this->host}:{$this->port} failed.";
+                    break;
+                case SOCKET_ETIMEDOUT:
+                    $this->lastErrNo = MEMCACHED::RES_TIMEOUT;
+                    $this->lastErrMsg = "Connection to {$this->host}:{$this->port} timed out.";
+                    break;
+                case SOCKET_EHOSTUNREACH:
+                    $this->lastErrNo = MEMCACHED::RES_HOST_LOOKUP_FAILURE;
+                    $this->lastErrMsg = "No route to {$this->host}:{$this->port}.";
+                    break;
+                default:
+                    $this->lastErrMsg = "unknown error {$this->lastErrNo}. Connection to {$this->host}:{$this->port} failed.";
+            }
+            trigger_error("Connection to {$this->host}:{$this->port} failed.", E_USER_WARNING);
 
-           return false;
+            return false;
        }
+    }
+
+    /**
+     * Connect to memcache server
+     * @param bool $skipAuth skip authentication process for commands that don't need it
+     * @return bool
+     */
+    public function connect($skipAuth = false)
+    {
+        if(is_resource($ret = $this->tcpConnection())) {
+            if (true === $this->needAuth()) {
+                if (false === $skipAuth && true === $this->hasCredentials()) {
+                    if (! $this->authenticating) {
+                        $this->saslAuth();
+                        if (false === $this->authenticated) {
+                            fclose($ret);
+                            
+                            return false;
+                        }
+                    }
+                }
+            }
+            
+            return true;
+        }
+        
+        return false;
     }
 
     /**
@@ -176,7 +211,7 @@ class MemcachedClient
     }
 
     /**
-     * Generic method for storage commands
+     * Generic method for storage commands in ASCII protocol
      * @param $commandName
      * @param $key
      * @param $value
@@ -191,21 +226,10 @@ class MemcachedClient
 
             return false;
         }
+        
         $commandName = strtolower($commandName);
         $key = $this->options[Memcached::OPT_PREFIX_KEY] . $key;
-        $flag = $this->flag($value);
-        if ($flag & 128) {
-            $value = $this->serializer->serialize($value);
-        }
-        if (null !== $this->compressor && ($flag & 256)) {
-            $tmp = $this->compressor->compress($value);
-            if(strlen($value) > strlen($tmp) * $this->options[Memcached::OPT_COMPRESSION_FACTOR]) {
-                $value = $tmp;
-                unset($tmp);
-            } else {
-                $flag -= 256;
-            }
-        }
+        list($flag, $value) = $this->prepareStoredData($value);
         $bytes = strlen((string)$value);
         if (false === $noreply) {
             $noreply = '';
@@ -235,17 +259,18 @@ class MemcachedClient
         } else {
             $command .= "\r\n{$value}\r\n";
         }
-        //echo $command;
         $commandLen = strlen($command);
         if ($commandLen == fwrite($this->conn, $command, $commandLen)) {
             if (false !== ($response = fgets($this->conn, 512))) {
                 $response = rtrim($response);
                 if ($this->isError($response)) {
+                    
                     return false;
                 }
                 if ($expectAnswer == $response) {
                     $this->lastErrNo = Memcached::RES_SUCCESS;
                     $this->lastErrMsg = '';
+                    
                     return true;
                 } else {
                     switch($expectAnswer) {
@@ -271,24 +296,25 @@ class MemcachedClient
             $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
             $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
         }
+        
         return false;
     }
 
     /**
-     * Generic method for retrieval commands
+     * Generic method for retrieval commands in ASCII protocol
      * @param $commandName
      * @param $key
      * @param null $value
      * @param null $exp
-     * @param bool $rawValue
      * @return array|bool|mixed
      */
-    protected function retrievalCommand($commandName, $key, $value = null, $exp = null, $rawValue = false)
+    protected function retrievalCommand($commandName, $key, $value = null, $exp = null)
     {
         if (false === $this->connect()) {
 
             return false;
         }
+        
         $ret = [];
         $commandName = strtolower($commandName);
         if (is_array($key)) {
@@ -314,7 +340,6 @@ class MemcachedClient
             }
         }
         $command = rtrim($command) . "\r\n";
-        //echo $command;
         $commandLen = strlen($command);
         if ($commandLen == fwrite($this->conn, $command, $commandLen)) {
             if (in_array($commandName, ['decr', 'incr'])) {
@@ -374,12 +399,9 @@ class MemcachedClient
                                     }
                                 } while($chunkLen > $retValLen);
                             }
-                            if (false === $rawValue) {
-                                $returnValue = $this->setType($returnValue, $flag);
-                            }
                             $ret[] = [
                                 'key' => $key_name,
-                                'value' => $returnValue,
+                                'value' => $this->setType($returnValue, $flag),
                                 'cas' => $cas,
                                 'flags' => $flag,
                             ];
@@ -402,9 +424,97 @@ class MemcachedClient
             $this->lastErrNo = Memcached::RES_NOTFOUND;
             $this->lastErrMsg = "key [{$key}] not found on server {$this->host}:{$this->port}.";
         }
+        
+        return $ret;
+    }
+    
+    /**
+     * Generic method for simple commands in ASCII protocol
+     * @param resource $connection
+     * @param string $command
+     * @return bool|mixed
+     */
+    protected function executeSimpleCommand($connection, $command)
+    {
+        if (false === $this->connect()) {
+
+            return false;
+        }
+        
+        if ("\r\n" != substr($command, -2,2)) {
+            $command .= "\r\n";
+        }
+        $written = fwrite($connection, $command, strlen($command));
+        if(false === $written) {
+            $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
+            $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
+            $ret = false;
+        } else {
+            if (false === ($ret = fgets($connection, 512))) {
+                $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
+                $this->lastErrMsg = "reading from  {$this->host}:{$this->port} failed.";
+            }
+            if ($this->isError($ret)) {
+                $ret = false;
+            }
+        }
+        
         return $ret;
     }
 
+    /**
+     * Generic method for storage commands in binary protocol
+     * @param $opcode
+     * @param $key
+     * @param $value
+     * @param $exp
+     * @return bool
+     */
+    protected function storageCommandBinary($opcode, $key, $value, $exp = null)
+    {
+        if (false === $this->connect()) {
+
+            return false;
+        }
+
+        if (in_array($opcode, [0x0e, 0x19, 0x0f, 0x1a])) {
+            list($flags, $value) = $this->prepareStoredData($value);
+            $v = current($this->get($key));
+            if(1 != $v['flags'] || 1 !== $flags) {
+                return false;
+            }
+            $request = [
+                    'opcode' => $opcode,
+                    'key' => $key,
+                    'value' => $value,
+            ];
+        } elseif (in_array($opcode, [0x1c, 0x04, 0x14])) {
+            $request = [
+                    'opcode' => $opcode,
+                    'key' => $key,
+                    'extra' => $exp,
+            ];
+        } elseif (in_array($opcode, [0x18, 0x08])) {
+            $request = [
+                    'opcode' => $opcode,
+                    'extra' => $exp,
+            ];
+        } else {
+            list($flags, $value) = $this->prepareStoredData($value);
+            $request = [
+                    'opcode' => $opcode,
+                    'key' => $key,
+                    'value' => $value,
+                    'extra' =>  pack('NN', $flags, $exp),
+            ];
+        }
+        $this->binRequest($request);
+        $data = $this->binResponse();
+
+        return Memcached::RES_SUCCESS === $this->lastErrNo;
+    }
+
+    
     /**
      * Store given key only if it doesn't exist
      * @param $key
@@ -415,7 +525,13 @@ class MemcachedClient
      */
     public function add($key, $value, $exp, $noreply = false)
     {
-        return $this->storageCommand('add', $key, $value, $exp, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(($noreply ? 0x12 : 0x02), $key, $value, $exp);
+        } else {
+            
+            return $this->storageCommand('add', $key, $value, $exp, $noreply);
+        }
     }
 
     /**
@@ -428,7 +544,13 @@ class MemcachedClient
      */
     public function set($key, $value, $exp, $noreply = false)
     {
-        return $this->storageCommand('set', $key, $value, $exp, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(($noreply ? 0x11 : 0x01), $key, $value, $exp);
+        } else {
+            
+            return $this->storageCommand('set', $key, $value, $exp, $noreply);
+        }
     }
 
     /**
@@ -441,7 +563,13 @@ class MemcachedClient
      */
     public function replace($key, $value, $exp, $noreply = false)
     {
-        return $this->storageCommand('replace', $key, $value, $exp, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(($noreply ? 0x13 : 0x03), $key, $value, $exp);
+        } else {
+            
+            return $this->storageCommand('replace', $key, $value, $exp, $noreply);
+        }
     }
 
     /**
@@ -453,7 +581,13 @@ class MemcachedClient
      */
     public function prepend($key, $value, $noreply = false)
     {
-        return $this->storageCommand('prepend', $key, $value, 0, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(($noreply ? 0x1a : 0x0f), $key, $value);
+        } else {
+            
+            return $this->storageCommand('prepend', $key, $value, 0, $noreply);
+        }
     }
 
     /**
@@ -465,7 +599,13 @@ class MemcachedClient
      */
     public function append($key, $value, $noreply = false)
     {
-        return $this->storageCommand('append', $key, $value, 0, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(($noreply ? 0x19 : 0x0e), $key, $value);
+        } else {
+            
+            return $this->storageCommand('append', $key, $value, 0, $noreply);
+        }
     }
 
     /**
@@ -479,7 +619,17 @@ class MemcachedClient
      */
     public function cas($key, $value, $exp, $cas, $noreply = false)
     {
-        return $this->storageCommand('cas', $key, $value, $exp, $cas, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            $v = current($this->get($key));
+            if($cas == $v['cas']) {
+                return $this->set($key, $value, $exp, $noreply);
+            } else {
+                return false;
+            }
+        } else {
+            
+            return $this->storageCommand('cas', $key, $value, $exp, $cas, $noreply);
+        }
     }
 
     /**
@@ -491,7 +641,13 @@ class MemcachedClient
      */
     public function touch($key, $exp, $noreply = false)
     {
-        return $this->storageCommand('touch', $key, null, $exp, null, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            
+            return $this->storageCommandBinary(0x1c, $key, null, pack('N', $exp));
+        } else {
+            
+            return $this->storageCommand('touch', $key, null, $exp, null, $noreply);
+        }
     }
 
     /**
@@ -502,63 +658,486 @@ class MemcachedClient
      */
     public function delete($key, $noreply = false)
     {
-        return $this->storageCommand('delete', $key, null, null, null, $noreply);
+        if (true === $this->isBinaryProtocol()) {
+            return $this->storageCommandBinary(($noreply ? 0x14 : 0x04), $key, null, $exp);
+        } else {
+            return $this->storageCommand('delete', $key, null, null, null, $noreply);
+        }
     }
 
     /**
      * Get value of given key
      * @param $key
-     * @param bool $rawValue
      * @return array|bool|mixed
      */
-    public function get($key, $rawValue = false)
+    public function get($key)
     {
-        return $this->retrievalCommand('get', $key, null, null, $rawValue);
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(
+                array(
+                    'opcode' => 0x00,
+                    'key' => $key,
+                )
+            );
+
+            $data = $this->binResponse();
+            if(Memcached::RES_SUCCESS === $this->lastErrNo) {
+                return [[
+                    'key'   => $key,
+                    'value' => $this->settype($data['value'], $data['flags']),
+                    'cas'   => $data['cas'],
+                    'flags' => $data['flags'],
+                ]];
+            }
+            
+            return false;
+        } else {
+            return $this->retrievalCommand('get', $key, null, null);
+        }
     }
 
     /**
      * Get value of multiple keys
      * @param array $keys
-     * @param bool $rawValue
      * @return array|bool|mixed
      */
-    public function gets(array $keys, $rawValue = false)
+    public function gets(array $keys)
     {
-        return $this->retrievalCommand('gets', $keys, null, null, $rawValue);
+        if (true === $this->isBinaryProtocol()) {
+            $ret = [];
+            $pipeline = array_fill(0, ($n=count($keys)), ['opcode' => 0x0d, 'key' => null]);
+            for ($i=0; $i<$n; $i++) {
+               $pipeline[$i]['key'] = $keys[$i];
+               if ($i == $n-1) {
+                   $pipeline[$i]['opcode'] = 0x0c;
+               }
+            }
+            $this->binRequest($pipeline);
+            for ($i=0; $i<$n; $i++) {
+                $ret[] = $this->binResponse();
+            }
+            return $ret;
+        } else {
+            return $this->retrievalCommand('gets', $keys, null, null);
+        }
     }
 
     /**
      * Modify expiration time of given key and fetch its value
-     * @param $key
+     * @param array $key
      * @param $exp
-     * @param bool $rawValue
      * @return array|bool|mixed
      */
-    public function gat($key, $exp, $rawValue = false)
+    public function gat($key, $exp)
     {
-        return $this->retrievalCommand('gat', $key, null, $exp, $rawValue);
+        return $this->gats([$key], $exp);
     }
-
     /**
      * Modify expiration time of multiple keys and fetch their value
      * @param array $keys
      * @param $exp
-     * @param bool $rawValue
      * @return array|bool|mixed
      */
-    public function gats(array $keys, $exp, $rawValue = false)
+    public function gats(array $keys, $exp)
     {
-        return $this->retrievalCommand('gats', $keys, null, $exp, $rawValue);
+        if (true === $this->isBinaryProtocol()) {
+            $pipeline = [];
+            $n = count($keys);
+            for ($i=0; $i<$n; $i++) {
+                $pipeline[] = ['opcode' => ($i == $n-1 ? 0x0d : 0x0c), 'key' => $keys[$i]];
+                $pipeline[] = ['opcode' => 0x1c, 'key' => $keys[$i], 'extra' => pack('N', $exp)];
+            }
+            $n = count($pipeline);
+            $this->binRequest($pipeline);
+            for ($i=0; $i<$n; $i++) {
+                $tmp = $this->binResponse();
+                if (!empty($tmp['key']) && 0<$tmp['cas']) {
+                    $ret[] = $tmp;
+                }
+            }
+            return $ret;
+        } else {
+            return $this->retrievalCommand('gats', $keys, null, $exp);
+        }
     }
 
+    /**
+     * Increment value of given integer key
+     * @param $key
+     * @param $value
+     * @return array|bool|mixed
+     */
+    public function incr($key, $value, $initialValue, $exp)
+    {
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(
+                [
+                    'opcode' => 0x05,
+                    'key' => $key,
+                    'extra' => pack('JJN', $value, $initialValue, $exp),
+                ]
+            );
+
+            $data = $this->binResponse();
+            if(Memcached::RES_SUCCESS === $this->lastErrNo) {
+                $rawResponse = unpack('Jvalue', $data['value']);
+                return $this->settype($rawResponse['value'], 2);
+            }
+            
+            return false;
+        } else {
+            return $this->retrievalCommand('incr', $key, $value);
+        }
+    }
+
+    /**
+     * Decrement value of given integer key
+     * @param $key
+     * @param $value
+     * @return array|bool|mixed
+     */
+    public function decr($key, $value)
+    {
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(
+                [
+                    'opcode' => 0x06,
+                    'key' => $key,
+                    'extra' => pack('JJN', $value, $initialValue, $exp),
+                ]
+            );
+
+            $data = $this->binResponse();
+            if(Memcached::RES_SUCCESS === $this->lastErrNo) {
+                $rawResponse = unpack('Jvalue', $data['value']);
+                return $this->settype($rawResponse['value'], 2);
+            }
+            
+            return false;
+        } else {
+            return $this->retrievalCommand('decr', $key, $value);
+        }
+    }
+
+    /**
+     * Get various statistics depending on provided type (null, settings, items, sizes, slabs, conns)
+     * @param null $type
+     * @return array|bool|mixed
+     */
+    public function stats($type = null)
+    {
+        if (true === $this->isBinaryProtocol()) {
+            $ret = [];
+            $request = ['opcode' => 0x10];
+            if(null !== $type && in_array($type, ['settings', 'items', 'sizes', 'slabs', 'conns'])) {
+                $request['key'] = $type;
+            }
+            $this->binRequest($request);
+            while(true) {
+                $data = $this->binResponse();
+                if('' == $data['key'].$data['value']) {
+                    break;
+                }
+                $ret[] = ['key' => $data['key'], 'value' => $data['value']];
+            }
+            
+            return $ret;
+        } else {
+            return $this->retrievalCommand('stats', $type, null, null);
+        }
+    }
+
+    /**
+     * Get server version
+     * @return bool|string
+     */
+    public function version()
+    {
+        $ret = '';
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(['opcode' => 0x0b]);
+            if(is_array($data = $this->binResponse()) && array_key_exists('value', $data)) {
+                $ret = strval($data['value']);
+            } else {
+                return false;
+            }
+        } else {
+            $ret = $this->executeSimpleCommand($this->conn, 'version');
+            if (false !== $ret) {
+                $ret = rtrim(substr($ret, strpos($ret, ' ') + 1));
+            }
+        }
+        return $ret;
+    }
+
+    /**
+     * Invalidate all existing items immediately (by default) or after the expiration specified
+     * @param null $exp
+     * @param bool $noreply
+     * @return bool
+     */
+    public function flush($exp = null, $noreply = false)
+    {
+        $ret = '';
+        if (true === $this->isBinaryProtocol()) {
+            
+            if($this->storageCommandBinary(($noreply ? 0x18 : 0x08), null, null, pack('N', $exp))) {
+                $ret = "OK\r\n";
+            }
+        } else {
+            if (null === $exp) {
+                $exp = '';
+            }
+            if (false === $noreply) {
+                $noreply = '';
+            } else {
+                $noreply = 'noreply';
+            }
+            $command = rtrim(preg_replace('/\s+/', ' ', "flush_all {$exp} {$noreply}"));
+            $ret = $this->executeSimpleCommand($this->conn, $command);
+        }
+        return $ret == "OK\r\n";
+    }
+
+    /**
+     * Alias of method flush
+     * Invalidate all existing items immediately (by default) or after the expiration specified
+     * @param null $exp
+     * @param bool $noreply
+     * @return bool
+     */
+    public function flush_all($exp = null, $noreply = false)
+    {
+        return $this->flush($exp, $noreply);
+    }
+    
+    /**
+     * Get server authentication mechanisms
+     * @return array
+     */
+    public function sasl_list_mechs()
+    {
+        if (is_array($this->saslMechsList)) {
+            return $this->saslMechsList;
+        }
+        if (false === $this->connect(true)) {
+
+            return false;
+        }
+        return $this->saslGetAndSetMechs();
+    }
+    
+    protected function saslGetAndSetMechs() {
+        $ret = null;
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(['opcode' => 0x20]);
+            $data = $this->binResponse();
+            $ret = explode(' ', $data['value']);
+            $this->saslMechsList = $ret;
+        }
+        return $ret;
+    }
+    
+    /**
+     * Set auth credentials
+     */
+    public function sasl_auth($username, $password)
+    {
+        if (false === $this->options[Memcached::OPT_BINARY_PROTOCOL]) {
+            trigger_error(
+                'SASL authentication is only supported with binary protocol',
+                E_USER_WARNING
+            );
+        }
+        $this->username = $username;
+        $this->password = $password;
+        
+        return true;
+    }
+    
+    /**
+     * SASL authentication
+     * @return bool
+     */
+    protected function saslAuth()
+    {
+        $ret = false;
+        $this->authenticating = true;
+        if(false === $this->authenticated) {
+            if (null === $this->saslMechsList) {
+                $this->saslGetAndSetMechs();
+            }
+            $knownAlgos = [];
+            foreach ($this->saslMechsList as $mech) {
+                $mech = str_replace('-', '_', $mech);
+                if($const = @constant(__NAMESPACE__ . '\Memcached::SASL_AUTH_' . $mech)) {
+                    $knownAlgos[] = $const;
+                }
+            }
+            if(in_array($this->options[Memcached::OPT_SASL_AUTH_METHOD], $knownAlgos)) {
+                switch ($this->options[Memcached::OPT_SASL_AUTH_METHOD]) {
+                    case Memcached::SASL_AUTH_DIGEST_MD5:
+                        $ret = $this->saslAuthDigestMd5();
+                        break;
+                    case Memcached::SASL_AUTH_CRAM_MD5:
+                        $ret = $this->saslAuthCramMd5();
+                        break;
+                    case Memcached::SASL_AUTH_LOGIN:
+                        $ret = $this->saslAuthLogin();
+                        break;
+                    case Memcached::SASL_AUTH_PLAIN:
+                        $ret = $this->saslAuthPlain();
+                        break;
+                    case Memcached::SASL_AUTH_ANONYMOUS:
+                        $ret = $this->saslAuthAnonymous();
+                        break;
+                    default:
+                        $ret = false;
+                }
+                if(true === $ret) {
+                    $this->authenticated = true;
+                }
+            } else {
+                trigger_error(
+                    'selected authentication method is unsupported, valid options are [' . join(', ', $this->saslMechsList) . ']',
+                    E_USER_ERROR
+                );
+            }
+            $this->authenticating = false;
+        } else {
+            $ret = true;
+        }
+        
+        return $ret;
+    }
+    
+    /**
+     * Authenticate using SASL Digest-MD5
+     * @return bool
+     */
+    protected function saslAuthDigestMd5()
+    {
+        $this->binRequest([
+            'opcode' => 0x21,
+            'key' => 'DIGEST-MD5',
+        ]);
+        $data = $this->binResponse();
+        if (0x21 == $this->getLastErrNo()) {
+            $auth = new SaslAuthDigestMd5();
+            $challengeResponse = $auth->getChallengeResponse(
+                $this->username, $this->password, $data['value'], 'rozhenko', 'memcached'
+            );
+            $this->binRequest([
+                'opcode' => 0x22,
+                'key' => 'DIGEST-MD5',
+                'value' => $challengeResponse
+            ]);
+            $data = $this->binResponse();
+            if(0x21 == $this->getLastErrNo()) {
+                $this->binRequest([
+                    'opcode' => 0x22,
+                    'key' => 'DIGEST-MD5'
+                ]);
+            }
+            $data = $this->binResponse();
+        }
+        
+        return Memcached::RES_SUCCESS == $this->getLastErrNo();
+    }
+    
+    /**
+     * Authenticate using SASL CRAM-MD5
+     * @return bool
+     */
+    protected function saslAuthCramMd5()
+    {
+        $this->binRequest([
+            'opcode' => 0x21,
+            'key' => 'CRAM-MD5',
+        ]);
+        $data = $this->binResponse();
+        if (0x21 == $this->getLastErrNo()) {
+            $this->binRequest([
+                'opcode' => 0x22,
+                'key' => 'CRAM-MD5',
+                'value' => $this->username
+                    . ' '
+                    . hash_hmac('md5', $data['value'], $this->password)
+            ]);
+            $data = $this->binResponse();
+        }
+        
+        return Memcached::RES_SUCCESS == $this->getLastErrNo();
+    }
+    
+    /**
+     * Authenticate using SASL LOGIN
+     * @return bool
+     */
+    protected function saslAuthLogin()
+    {
+        $this->binRequest([
+            'opcode' => 0x21,
+            'key' => 'LOGIN',
+            'value' => $this->username
+        ]);
+        $data = $this->binResponse();
+        if(0x21 == $this->getLastErrNo()) {
+            $this->binRequest([
+                'opcode' => 0x22,
+                'key' => 'LOGIN',
+                'value' => $this->password
+            ]);
+            $data = $this->binResponse();
+        }
+
+        return Memcached::RES_SUCCESS == $this->getLastErrNo();
+    }
+    
+    /**
+     * Authenticate using SASL PLAIN
+     * @return bool
+     */
+    protected function saslAuthPlain()
+    {
+        $this->binRequest([
+            'opcode' => 0x21,
+            'key' => 'PLAIN',
+            'value' => '' . chr(0) . $this->username . '@' . trim(`hostname`) . chr(0) . $this->password,
+        ]);
+        $data = $this->binResponse();
+        
+        return Memcached::RES_SUCCESS == $this->getLastErrNo();
+    }
+    
+    /**
+     * Authenticate using SASL ANONYMOUS
+     * @return bool
+     */
+    protected function saslAuthAnonymous()
+    {
+        $this->binRequest([
+            'opcode' => 0x21,
+            'key' => 'ANONYMOUS',
+            'value' => $this->username,
+        ]);
+        $data = $this->binResponse();
+        
+        return Memcached::RES_SUCCESS == $this->getLastErrNo();
+    }
+    
+    
     /**
      * Return all keys currently held on servers
      * @return array|int
      */
     public function getAllKeysWithCacheDump()
     {
-        if (false === $this->connect()) {
-
+        if (true === $this->isBinaryProtocol()) {
+            trigger_error(
+                'function [' . __FUNCTION__ . '] not implemented in binary protocol',
+                E_USER_WARNING
+            );
             return false;
         }
         $command = "stats items\r\n" . 'stats cachedump $slabindex $count' . "\r\n";
@@ -634,13 +1213,15 @@ class MemcachedClient
      */
     function getAllKeysWithLruCrawler()
     {
-        if (false === $this->connect()) {
-
+        if (true === $this->isBinaryProtocol()) {
+            trigger_error(
+                'function [' . __FUNCTION__ . '] not implemented in binary protocol',
+                E_USER_WARNING
+            );
             return false;
         }
         $ret = [];
         $command = "lru_crawler metadump all\r\n";
-        //echo $command;
         $written = fwrite($this->conn, $command, strlen($command));
         if(false === $written) {
             $ret = [];
@@ -656,110 +1237,7 @@ class MemcachedClient
         }
         return $ret;
     }
-
-    /**
-     * Increment value of given integer key
-     * @param $key
-     * @param $value
-     * @return array|bool|mixed
-     */
-    public function incr($key, $value)
-    {
-        return $this->retrievalCommand('incr', $key, $value);
-    }
-
-    /**
-     * Decrement value of given integer key
-     * @param $key
-     * @param $value
-     * @return array|bool|mixed
-     */
-    public function decr($key, $value)
-    {
-        return $this->retrievalCommand('decr', $key, $value);
-    }
-
-    /**
-     * Get various statistics depending on provided type (null, settings, items, sizes, slabs, conns)
-     * @param null $type
-     * @return array|bool|mixed
-     */
-    public function stats($type = null)
-    {
-        return $this->retrievalCommand('stats', $type, null, null);
-    }
-
-    /**
-     * Get server version
-     * @return bool|string
-     */
-    public function version()
-    {
-        if (false === $this->connect()) {
-
-            return false;
-        }
-        $ret = '';
-        $command = "version\r\n";
-        //echo $command;
-        $written = fwrite($this->conn, $command, strlen($command));
-        if(false == $written) {
-            $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
-            $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
-            $ret = false;
-        } else {
-            $ret = fgets($this->conn, 512);
-            if(false === $ret) {
-                $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
-                $this->lastErrMsg = "reading from {$this->host}:{$this->port} failed.";
-                $ret = false;
-            } else {
-                $ret = rtrim(substr($ret, strpos($ret, ' ') + 1));
-            }
-        }
-
-        return $ret;
-    }
-
-    /**
-     * Invalidate all existing items immediately (by default) or after the expiration specified
-     * @param null $exp
-     * @param bool $noreply
-     * @return bool
-     */
-    public function flush_all($exp = null, $noreply = false)
-    {
-        if (false === $this->connect()) {
-
-            return false;
-        }
-        $ret = '';
-        if (null === $exp) {
-            $exp = '';
-        }
-        if (false === $noreply) {
-            $noreply = '';
-        } else {
-            $noreply = 'noreply';
-        }
-        $command = rtrim(preg_replace('/\s+/', ' ', "flush_all {$exp} {$noreply}")) . "\r\n";
-        //echo $command;
-        $written = fwrite($this->conn, $command, strlen($command));
-        if(false == $written) {
-            $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
-            $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
-            $ret = 'KO';
-        } else {
-            $ret = fgets($this->conn, 512);
-            if(false === $ret) {
-                $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
-                $this->lastErrMsg = "reading from {$this->host}:{$this->port} failed.";
-                $ret = 'KO';
-            }
-        }
-        return $ret == "OK\r\n";
-    }
-
+    
     /**
      * Allows runtime adjustments of the cache memory limit
      * @param $size
@@ -768,8 +1246,11 @@ class MemcachedClient
      */
     public function cache_memlimit($size, $noreply = false)
     {
-        if (false === $this->connect()) {
-
+        if (true === $this->isBinaryProtocol()) {
+            trigger_error(
+                'function [' . __FUNCTION__ . '] not implemented in binary protocol',
+                E_USER_WARNING
+            );
             return false;
         }
         $ret = '';
@@ -779,21 +1260,8 @@ class MemcachedClient
             $noreply = 'noreply';
         }
         $size = min($size, $this->maxAllowableMem);
-        $command = rtrim(preg_replace('/\s+/', ' ', "cache_memlimit {$size} {$noreply}")) . "\r\n";
-        //echo $command;
-        $written = fwrite($this->conn, $command, strlen($command));
-        if(false == $written) {
-            $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
-            $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
-            $ret = 'KO';
-        } else {
-            $ret = fgets($this->conn, 512);
-            if(false === $ret) {
-                $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
-                $this->lastErrMsg = "reading from {$this->host}:{$this->port} failed.";
-                $ret = 'KO';
-            }
-        }
+        $command = rtrim(preg_replace('/\s+/', ' ', "cache_memlimit {$size} {$noreply}"));
+        $ret = $this->executeSimpleCommand($this->conn, $command);
         return $ret == "OK\r\n";
     }
 
@@ -805,35 +1273,70 @@ class MemcachedClient
      */
     public function verbosity($level, $noreply = false)
     {
-        if (false === $this->connect()) {
-
-            return false;
-        }
         $ret = '';
+        $level = max(min($level, 3), 0);
+        if(null === $this->serverVersion) {
+            $this->serverVersion = $this->version();
+        }
+
+        $match = [];
+        preg_match('/^([0-9]+\.[0-9]+\.[0-9]+).*/', $this->serverVersion, $match);
+        $versionMatch = version_compare($match[1], '1.6.0') >= 0;
+        if (true === $this->isBinaryProtocol()) {
+            if ($versionMatch) {
+                $this->binRequest(['opcode' => 0x1b, 'extra' => pack('N', $level)]);
+                $data = $this->binResponse();
+                if ($this->lastErrNo == Memcached::RES_SUCCESS) {
+                    
+                    return true;
+                } else {
+                    
+                    return false;
+                }
+            } else {
+                trigger_error(
+                    'function [' . __FUNCTION__ . '] not implemented in version < 1.6.0',
+                    E_USER_WARNING
+                );
+                
+                return false;
+            }
+        }
+
         if (false === $noreply) {
             $noreply = '';
         } else {
             $noreply = 'noreply';
         }
-        $size = max(min($level, 3), 0);
-        $command = rtrim(preg_replace('/\s+/', ' ', "verbosity {$size} {$noreply}")) . "\r\n";
-        //echo $command;
-        $written = fwrite($this->conn, $command, strlen($command));
-        if(false == $written) {
-            $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
-            $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
-            $ret = 'KO';
-        } else {
-            $ret = fgets($this->conn, 512);
-            if(false === $ret) {
-                $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
-                $this->lastErrMsg = "reading from {$this->host}:{$this->port} failed.";
-                $ret = 'KO';
-            }
-        }
+        $command = rtrim(preg_replace('/\s+/', ' ', "verbosity {$level} {$noreply}"));
+        $ret = $this->executeSimpleCommand($this->conn, $command);
         return $ret == "OK\r\n";
     }
 
+    /**
+     * Send no-op command
+     * @return bool
+     */
+    public function noop()
+    {
+        if (true === $this->isBinaryProtocol()) {
+            $this->binRequest(['opcode' => 0x0a]);
+            $data = $this->binResponse();
+            if (Memcached::RES_SUCCESS == $this->lastErrNo) {
+                $this->lastErrMsg = '';
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            trigger_error(
+                'function [' . __FUNCTION__ . '] not implemented in ASCII protocol',
+                E_USER_WARNING
+            );
+            return false;
+        }
+    }
+    
     /**
      * Upon receiving this command, the server closes the connection
      * @return true|string
@@ -842,25 +1345,21 @@ class MemcachedClient
     {
         $ret = true;
         if (is_resource($this->conn)) {
-            $command = "quit\r\n";
-            //echo $command;
-            $written = fwrite($this->conn, $command, strlen($command));
-            if(false == $written) {
-                $this->lastErrNo = Memcached::RES_WRITE_FAILURE;
-                $this->lastErrMsg = "writing {$this->host}:{$this->port} failed.";
-                $ret = false;
+            if (true === $this->isBinaryProtocol()) {
+                $this->binRequest(['opcode' => 0x07]);
+                $data = $this->binResponse();
+                if (Memcached::RES_SUCCESS == $this->lastErrNo) {
+                    $this->lastErrMsg = "disconnected from {$this->host}:{$this->port}.";
+                }
             } else {
-                if (false === ($ret = fgets($this->conn, 512))) {
-                    $this->lastErrNo = Memcached::RES_UNKNOWN_READ_FAILURE;
-                    $this->lastErrMsg = "reading from  {$this->host}:{$this->port} failed.";
-                    $ret = false;
-                } else {
-                    $ret = substr($ret, strpos($ret, ' ') + 1);
+                $ret = $this->executeSimpleCommand($this->conn, 'quit');
+                if (false !== $ret) {
+                    $ret = true;
                 }
             }
             fclose($this->conn);
+            $this->conn = null;
         }
-        $this->conn = null;
         return $ret;
     }
 
@@ -921,6 +1420,187 @@ class MemcachedClient
         }
     }
 
+
+    /**
+     * Handle memcached binary request
+     * @param array $data 
+     * @return bool | int
+     */
+    protected function binRequest(array $pipeItems)
+    {
+        if (false === $this->connect()) {
+            
+            return false;
+        }
+        
+        $pipeline = '';
+        $isPipeline = true;
+        foreach (array_keys($pipeItems) as $k) {
+            if(!is_int($k)) {
+                $isPipeline = false;
+                break;
+            }
+        }
+        
+        if (! $isPipeline) {
+            $pipeItems = [$pipeItems];
+        }
+        
+        foreach ($pipeItems as $data) {
+            $request = '';
+            $valuelength = $extralength = $keylength = 0;
+
+            if (array_key_exists('extra', $data))
+            {
+                $extralength = strlen($data['extra']);
+            }
+
+            if (array_key_exists('key', $data))
+            {
+                if (! in_array($data['opcode'], [0x10, 0x21, 0x22])) {
+                    if ('' !== $this->options[Memcached::OPT_PREFIX_KEY]) {
+                        $data['key'] = $this->options[Memcached::OPT_PREFIX_KEY] . $data['key'];
+                    }
+                }
+                $keylength = strlen($data['key']);
+            }
+
+            if (array_key_exists('value', $data))
+            {
+                $valuelength = strlen($data['value']);
+            }
+
+            $bodylength = $extralength + $keylength + $valuelength;
+
+            $request = pack(
+                'CCnCCnNNJ',
+                0x80,
+                $data['opcode'],
+                $keylength,
+                $extralength,
+                array_key_exists('datatype', $data) ? $data['datatype'] : null,
+                array_key_exists('vbucket_id', $data) ? $data['vbucket_id'] : null,
+                $bodylength,
+                array_key_exists('Opaque', $data) ? $data['Opaque'] : null,
+                array_key_exists('CAS', $data) ? $data['CAS'] : null
+            );
+
+            if (array_key_exists('extra', $data))
+            {
+                $request .= $data['extra'];
+            }
+
+            if (array_key_exists('key', $data))
+            {
+                $request .= $data['key'];
+            }
+
+            if (array_key_exists('value', $data))
+            {
+                $request .= $data['value'];
+            }
+            
+            $pipeline .= $request;
+        }
+
+        $sent = fwrite($this->conn, $pipeline);
+
+        return $sent;
+    }
+
+    /**
+     * Handle memcached binary response
+     * @return bool | mixed
+     */
+    protected function binResponse()
+    {
+        if (false === $this->connect()) {
+
+            return false;
+        }
+        
+        $data = fread($this->conn, 24);
+
+        if (false === $data || $data == '')
+        {
+            throw new SocketReadException("No Response from server {$this->host}:{$this->port}");
+        }
+        $response = unpack(
+            'Cmagic/Copcode/nkeylength/Cextralength/Cdatatype/nstatus/Nbodylength/NOpaque/JCAS', 
+            $data
+        );
+        $this->lastErrNo = $response['status'];
+        $this->lastErrMsg = Memcached::RES_SUCCESS === $this->lastErrNo ? '' : 'undefined error';
+
+        if (array_key_exists('bodylength', $response))
+        {
+            $bodylength = $response['bodylength'];
+            $data = '';
+            while ($bodylength > 0)
+            {
+                $binData = fread($this->conn, $bodylength);
+                $bodylength -= strlen($binData);
+                $data .= $binData;
+            }
+
+            if (array_key_exists('extralength', $response) && $response['extralength'] > 0)
+            {
+                $extra = unpack('Nint', substr($data, 0, $response['extralength']));
+                $response['extra'] = $extra['int'];
+            }
+
+            $response['key'] = substr($data, $response['extralength'], $response['keylength']);
+            if (! in_array($response['opcode'], [0x10, 0x21, 0x22])) {
+                if ('' !== $this->options[Memcached::OPT_PREFIX_KEY]) {
+                    $response['key'] = substr($response['key'], strlen($this->options[Memcached::OPT_PREFIX_KEY]));
+                }
+            }
+            
+            $response['body'] = substr($data, $response['extralength'] + $response['keylength']);
+            
+            if(Memcached::RES_SUCCESS !== $this->lastErrNo) {
+                $this->lastErrMsg = $response['body'];
+            }
+        }
+        if (!array_key_exists('extra', $response))
+        {
+            $response['extra'] = 0;
+        }
+        $ret = [
+            'key' => $response['key'],
+            'value' => $this->setType($response['body'], $response['extra']),
+            'cas' => $response['CAS'],
+            'flags' => $response['extra'],
+        ];
+        
+        return $ret;
+    }
+
+    /**
+     * Check wether binary protocol is on and authentication is required
+     * @return bool
+     */
+    public function isBinaryProtocol()
+    {
+        return true === $this->options[Memcached::OPT_BINARY_PROTOCOL];
+    }
+
+    /**
+     * Check wether binary protocol is on and authentication is required
+     * @return bool
+     */
+    protected function needAuth()
+    {
+        return true === $this->isBinaryProtocol()
+                && Memcached::SASL_AUTH_NONE != $this->options[Memcached::OPT_SASL_AUTH_METHOD];
+    }
+    
+    protected function hasCredentials()
+    {
+        return '' != $this->username . $this->password;
+    }
+
+
     /**
      * Get the flag corresponding to the given value type
      * @param $value
@@ -937,9 +1617,35 @@ class MemcachedClient
         $v += is_array($value) ? 32 : 0;
         $v += is_object($value) ? 64 : 0;
         $v += (32 == $v || 64 == $v) ? 128 : 0; // serializable
-        $condLenString = 1 == $v && $this->options[Memcached::OPT_COMPRESSION_THRESHOLD] < strlen($value);
-        $v += (($v & 128) == 128) || $condLenString? 256 : 0; // long string, array or object can be compressed
+        if(true === $this->options[Memcached::OPT_COMPRESSION]) {
+            $condLenString = 1 == $v && $this->options[Memcached::OPT_COMPRESSION_THRESHOLD] < strlen($value);
+            $v += (($v & 128) == 128) || $condLenString? 256 : 0; // long string, array or object can be compressed
+        }
         return $v;
+    }
+    
+    /**
+     * Prepare data for storage, serialization and compression may happen
+     * @param $value
+     * @return array[int, mixed]
+     */
+    protected function prepareStoredData($value)
+    {
+        $flag = $this->flag($value);
+        if ($flag & 128) {
+            $value = $this->serializer->serialize($value);
+        }
+        if (true === $this->options[Memcached::OPT_COMPRESSION] && null !== $this->compressor && ($flag & 256)) {
+            $tmp = $this->compressor->compress($value);
+            if(strlen($value) > strlen($tmp) * $this->options[Memcached::OPT_COMPRESSION_FACTOR]) {
+                $value = $tmp;
+            } else {
+                $flag -= 256;
+            }
+            unset($tmp);
+        }
+        
+        return [$flag, $value];
     }
 
     /**
@@ -950,23 +1656,26 @@ class MemcachedClient
      */
     protected function setType($value, $flag)
     {
-        $types = [
-            1 => 'string', 2 => 'integer', 4 => 'float', 8 => 'boolean',
-            16 => 'NULL', 32 => 'array', 64 => 'object',
-        ];
+        if (0 < $flag) { 
+            $types = [
+                1 => 'string', 2 => 'integer', 4 => 'float', 8 => 'boolean',
+                16 => 'NULL', 32 => 'array', 64 => 'object',
+            ];
 
-        if (null !== $this->compressor && ($flag & 256)) {
-            $value = $this->compressor->decompress($value);
-        }
-        if (null !== $this->serializer && ($flag & 128)) {
-            $value = $this->serializer->deserialize($value);
-        } else {
-            foreach ($types as $typeNo => $typeStr) {
-                if ($flag & $typeNo) {
-                    settype($value, $typeStr);
+            if (null !== $this->compressor && ($flag & 256)) {
+                $value = $this->compressor->decompress($value);
+            }
+            if (null !== $this->serializer && ($flag & 128)) {
+                $value = $this->serializer->deserialize($value);
+            } else {
+                foreach ($types as $typeNo => $typeStr) {
+                    if ($flag & $typeNo) {
+                        settype($value, $typeStr);
+                    }
                 }
             }
         }
+        
         return $value;
     }
 }

@@ -3,7 +3,7 @@
     "description": "Emulation of memcached php extension",
     "type": "library",
     "keywords": [
-        "firebase", "memcached", "extension", "cache", "memcache"
+        "cache", "memcached", "extension", "memcache"
     ],
     "license": "MIT",
     "authors": [

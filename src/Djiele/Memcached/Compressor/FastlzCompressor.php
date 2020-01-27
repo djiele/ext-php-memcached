@@ -3,11 +3,15 @@
 
 namespace Djiele\Memcached\Compressor;
 
+use Djiele\Memcached\Exception;
 
 class FastlzCompressor
 {
     public function compress($data, array $options = [])
     {
+        if(! function_exists('fastlz_compress')) {
+            throw new ConfigurationException('Module "fastlz" is not installed');
+        }
         if (isset($options['level']) && in_array($options['level'], [1, 2])) {
             $level = $options['level'];
         } else {
@@ -19,6 +23,9 @@ class FastlzCompressor
 
     public function decompress($data)
     {
+        if(! function_exists('fastlz_decompress')) {
+            throw new ConfigurationException('Module "fastlz" is not installed');
+        }
         return fastlz_decompress($data);
     }
 }

@@ -6,8 +6,15 @@ use Flexihash\Flexihash;
 use Flexihash\Exception;
 use Djiele\Memcached\DistributedHash\DistributedHashModula;
 use Flexihash\Hasher\HasherInterface;
-use Flexihash\Hasher\Crc32Hasher;
 use Flexihash\Hasher\Md5Hasher;
+use Flexihash\Hasher\Crc32Hasher;
+use Djiele\Memcached\Hasher\Fnv164Hasher;
+use Djiele\Memcached\Hasher\Fnv1A64Hasher;
+use Djiele\Memcached\Hasher\Fnv132Hasher;
+use Djiele\Memcached\Hasher\Fnv1A32Hasher;
+use Djiele\Memcached\Hasher\HsiehHasher;
+use Djiele\Memcached\Hasher\MurmurHasher;
+use Djiele\Memcached\Hasher\OneAtAtimeHasher;
 
 class Memcached
 {
@@ -31,6 +38,13 @@ class Memcached
     const DISTRIBUTION_CONSISTENT = 1;
     const HAVE_IGBINARY = 1;
     const HAVE_JSON = 1;
+    const SASL_AUTH_NONE = 1;
+    const SASL_AUTH_DIGEST_MD5 = 2;
+    const SASL_AUTH_CRAM_MD5 = 3;
+    const SASL_AUTH_LOGIN = 4;
+    const SASL_AUTH_PLAIN = 5;
+    const SASL_AUTH_ANONYMOUS = 6;
+    //const SASL_AUTH_NTLM = 7;
     const GET_PRESERVE_ORDER = 1;
     const GET_EXTENDED = 2;
 
@@ -56,6 +70,8 @@ class Memcached
     const OPT_POLL_TIMEOUT = 8;             // MEMCACHED_BEHAVIOR_POLL_TIMEOUT
     const OPT_CACHE_LOOKUPS = 6;            // MEMCACHED_BEHAVIOR_CACHE_LOOKUPS
     const OPT_SERVER_FAILURE_LIMIT = 21;    // MEMCACHED_BEHAVIOR_SERVER_FAILURE_LIMIT
+    const OPT_SASL_AUTH_METHOD = 25;
+
 
     const RES_SUCCESS = 0;                  // MEMCACHED_SUCCESS
     const RES_FAILURE = 1;                  // MEMCACHED_FAILURE
@@ -86,12 +102,12 @@ class Memcached
         self::OPT_COMPRESSION_TYPE => self::COMPRESSION_FASTLZ,
         self::OPT_SERIALIZER => self::SERIALIZER_IGBINARY,
         self::OPT_PREFIX_KEY => '',
-        self::OPT_HASH => self::HASH_CRC,
+        self::OPT_HASH => self::HASH_DEFAULT,
         self::OPT_DISTRIBUTION => self::DISTRIBUTION_CONSISTENT,
         self::OPT_LIBKETAMA_COMPATIBLE => false,
         self::OPT_BUFFER_WRITES => false,
         self::OPT_BINARY_PROTOCOL => false,
-        self::OPT_NO_BLOCK => true,
+        self::OPT_NO_BLOCK => false,
         self::OPT_TCP_NODELAY => false,
         self::OPT_SOCKET_SEND_SIZE => 32767,
         self::OPT_SOCKET_RECV_SIZE => 65535,
@@ -102,6 +118,7 @@ class Memcached
         self::OPT_POLL_TIMEOUT => 1000,
         self::OPT_CACHE_LOOKUPS => false,
         self::OPT_SERVER_FAILURE_LIMIT => 0,
+        self::OPT_SASL_AUTH_METHOD => self::SASL_AUTH_NONE,
     );
     protected static $instances = [];
     protected $persistentId = null;
@@ -126,12 +143,6 @@ class Memcached
         self::$instances[] = &$this;
     }
 
-    public function setCredentials($username, $password)
-    {
-        $this->username = $username;
-        $this->password = $password;
-    }
-
     /**
      * set Sasl AuthData
      * @param $username
@@ -140,7 +151,11 @@ class Memcached
     public function setSaslAuthData($username, $password)
     {
         $this->setCredentials($username, $password);
-        if (false === $this->option[self::OPT_BINARY_PROTOCOL]) {
+        if (true === $this->option[self::OPT_BINARY_PROTOCOL]) {
+            foreach ($this->server as $serverKey => &$serverData) {
+                $serverData['client']->sasl_auth($username, $password);
+            }
+        } else {
             trigger_error(
                 'Memcached::setSaslAuthData(): SASL is only supported with binary protocol',
                 E_USER_WARNING
@@ -175,8 +190,9 @@ class Memcached
      * @return bool
      * @throws Exception
      */
-    public function addServer($host, $port = 11211, $weight = 0, $init = true)
+    public function addServer($host, $port = 11211, $weight = 1, $init = true)
     {
+        $weight = max(1, $weight);
         $candidate = new MemcachedClient($host, $port, $this->option);
         $key = "{$host}:{$port}:{$weight}";
         $this->server[$key] = [
@@ -525,7 +541,7 @@ class Memcached
     {
         $i = 0;
         foreach ($this->getServerList() as $svrKey => $svr) {
-            $this->server[$svrKey]['client']->flush_all($delay + (2 * $i));
+            $this->server[$svrKey]['client']->flush_all($delay + (2 * $i++));
         }
         return true;
     }
@@ -854,19 +870,24 @@ class Memcached
      * @param int $offset
      * @param int $initial_value
      * @param int $expiry
-     * @return bool
+     * @return mixed int|bool
      * @throws Exception
      */
     public function increment($key, $offset = 1, $initial_value = 0, $expiry = 0)
     {
         $host = $this->distributedHash->lookup($key);
-        $value = $this->server[$host]['client']->incr($key, $offset);
+        $value = $this->server[$host]['client']->incr($key, $offset, $initial_value, $expiry);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
             return $value;
         } else {
-            return $this->add($key, $initial_value, $expiry);
+            $this->add($key, $initial_value, $expiry);
+            if(0 == $this->server[$host]['client']->getLastErrNo()) {
+                return $initial_value;
+            } else {
+                return false;
+            }
         }
     }
 
@@ -883,7 +904,7 @@ class Memcached
     public function incrementByKey($skey, $key, $offset = 1, $initial_value = 0, $expiry = 0)
     {
         $host = $this->getServerByKey($skey);
-        $value = $this->server[$host]['client']->incr($key, $offset);
+        $value = $this->server[$host]['client']->incr($key, $offset, $initial_value, $expiry);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
@@ -905,13 +926,18 @@ class Memcached
     public function decrement($key, $offset = 1, $initial_value = 0, $expiry = 0)
     {
         $host = $this->distributedHash->lookup($key);
-        $value = $this->server[$host]['client']->decr($key, $offset);
+        $value = $this->server[$host]['client']->decr($key, $offset, $initial_value, $expiry);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
             return $value;
         } else {
-            return $this->add($key, $initial_value, $expiry);
+            $this->add($key, $initial_value, $expiry);
+            if (0 == $this->server[$host]['client']->getLastErrNo()) {
+                return $initial_value;
+            } else {
+                return false;
+            }
         }
     }
 
@@ -928,7 +954,7 @@ class Memcached
     public function decrementByKey($skey, $key, $offset = 1, $initial_value = 0, $expiry = 0)
     {
         $host = $this->getServerByKey($skey);
-        $value = $this->server[$host]['client']->decr($key, $offset);
+        $value = $this->server[$host]['client']->decr($key, $offset, $initial_value, $expiry);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
@@ -986,14 +1012,13 @@ class Memcached
      * @param $key
      * @param null $cache_cb
      * @param int $flags
-     * @param bool $rawValue
      * @return bool|mixed
      * @throws Exception
      */
-    public function get($key, $cache_cb = null, $flags = 0, $rawValue = false)
+    public function get($key, $cache_cb = null, $flags = 0)
     {
         $host = $this->distributedHash->lookup($key);
-        return $this->getCommon($host, $key, $cache_cb, $flags, $rawValue);
+        return $this->getCommon($host, $key, $cache_cb, $flags);
     }
 
     /**
@@ -1002,14 +1027,13 @@ class Memcached
      * @param $key
      * @param null $cache_cb
      * @param int $flags
-     * @param bool $rawValue
      * @return bool|mixed
      * @throws Exception
      */
-    public function getByKey($skey, $key, $cache_cb = null, $flags = 0, $rawValue = false)
+    public function getByKey($skey, $key, $cache_cb = null, $flags = 0)
     {
         $host = $this->getServerByKey($skey);
-        return $this->getCommon($host, $key, $cache_cb, $flags, $rawValue);
+        return $this->getCommon($host, $key, $cache_cb, $flags);
     }
 
     /**
@@ -1018,12 +1042,11 @@ class Memcached
      * @param $key
      * @param null $cache_cb
      * @param int $flags
-     * @param bool $rawValue
      * @return array|bool|mixed|null
      * @throws Exception
      */
-    protected function getCommon($host, $key, $cache_cb = null, $flags = 0, $rawValue = false) {
-        $value = $this->server[$host]['client']->gets([$key], $rawValue);
+    protected function getCommon($host, $key, $cache_cb = null, $flags = 0) {
+        $value = $this->server[$host]['client']->gets([$key]);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
@@ -1034,7 +1057,7 @@ class Memcached
                 if(true === $cache_cb($this, $key, $newVal)) {
                     if($this->server[$host]['client']->set($key, $newVal, 0)) {
                         if ($flags && self::GET_EXTENDED) {
-                            $value = $this->server[$host]['client']->gets([$key], $rawValue);
+                            $value = $this->server[$host]['client']->gets([$key]);
                             if (0 == $this->server[$host]['client']->getLastErrNo()) {
                                 $this->resultCode = self::RES_SUCCESS;
                                 $this->resultMessage = '';
@@ -1056,11 +1079,10 @@ class Memcached
      * Retrieve multiple items
      * @param array $keys
      * @param int $flags
-     * @param bool $rawValue
      * @return array
      * @throws Exception
      */
-    public function getMulti(array $keys, $flags = 0, $rawValue = false)
+    public function getMulti(array $keys, $flags = 0)
     {
         $ret = array_combine(
             $keys,
@@ -1077,7 +1099,7 @@ class Memcached
         }
 
         foreach ($hosts as $host => $keys) {
-            $values = $this->server[$host]['client']->gets($keys, $rawValue);
+            $values = $this->server[$host]['client']->gets($keys);
             if (0 == $this->server[$host]['client']->getLastErrNo()) {
                 $ret = $this->returnMultipleValues($values, $flags);
             } else {
@@ -1094,14 +1116,13 @@ class Memcached
      * @param $skey
      * @param array $keys
      * @param int $flags
-     * @param bool $rawValue
      * @return array|false
      * @throws Exception
      */
-    public function getMultiByKey($skey, array $keys, $flags = 0, $rawValue = false)
+    public function getMultiByKey($skey, array $keys, $flags = 0)
     {
         $host = $this->distributedHash->lookup($skey);
-        $values = $this->server[$host]['client']->gets($keys, $rawValue);
+        $values = $this->server[$host]['client']->gets($keys);
         if (0 == $this->server[$host]['client']->getLastErrNo()) {
             $this->resultCode = self::RES_SUCCESS;
             $this->resultMessage = '';
@@ -1118,11 +1139,10 @@ class Memcached
      * @param array $keys
      * @param bool $with_cas
      * @param null $value_cb
-     * @param bool $rawValue
      * @return bool
      * @throws Exception
      */
-    public function getDelayed(array $keys, $with_cas = false, $value_cb = null, $rawValue = false)
+    public function getDelayed(array $keys, $with_cas = false, $value_cb = null)
     {
         $this->delayedResult = [];
         if (true === $with_cas) {
@@ -1130,7 +1150,7 @@ class Memcached
         } else {
             $flags = 0;
         }
-        if (is_array($resultSet = $this->getMulti($keys, $flags, $rawValue))) {
+        if (is_array($resultSet = $this->getMulti($keys, $flags))) {
             if(is_callable($value_cb)) {
                 foreach($resultSet as $keyResult => $valueResult) {
                     $value_cb($this, array_merge(['key' => $keyResult], $valueResult));
@@ -1150,11 +1170,10 @@ class Memcached
      * @param array $keys
      * @param bool $with_cas
      * @param null $value_cb
-     * @param bool $rawValue
      * @return bool
      * @throws Exception
      */
-    public function getDelayedByKey($skey, array $keys, $with_cas = false, $value_cb = null, $rawValue = false)
+    public function getDelayedByKey($skey, array $keys, $with_cas = false, $value_cb = null)
     {
         $this->delayedResult = [];
         if (true === $with_cas) {
@@ -1162,7 +1181,7 @@ class Memcached
         } else {
             $flags = 0;
         }
-        if (is_array($resultSet = $this->getMultiByKey($skey, $keys, $flags, $rawValue))) {
+        if (is_array($resultSet = $this->getMultiByKey($skey, $keys, $flags))) {
             if(is_callable($value_cb)) {
                 foreach($resultSet as $keyResult => $valueResult) {
                     $value_cb($this, array_merge(['key' => $keyResult], $valueResult));
@@ -1239,8 +1258,29 @@ class Memcached
             case self::HASH_MD5:
                 $this->hasher = new Md5Hasher();
                 break;
-            default:
+            case self::HASH_CRC:
                 $this->hasher = new Crc32Hasher();
+                break;
+            case self::HASH_FNV1_64:
+                $this->hasher = new Fnv164Hasher();
+                break;
+            case self::HASH_FNV1A_64:
+                $this->hasher = new Fnv1A64Hasher();
+                break;
+            case self::HASH_FNV1_32:
+                $this->hasher = new Fnv132Hasher();
+                break;
+            case self::HASH_FNV1A_32:
+                $this->hasher = new Fnv1A32Hasher();
+                break;
+            case self::HASH_HSIEH:
+                $this->hasher = new HsiehHasher();
+                break;
+            case self::HASH_MURMUR:
+                $this->hasher = new MurmurHasher();
+                break;
+            default:
+                $this->hasher = new OneAtAtimeHasher();
         }
     }
 
@@ -1279,7 +1319,7 @@ class Memcached
     /**
      * Parse response array and return appropriate multiple values set
      * @param array $values
-     * @param $flags
+     * @param int $flags
      * @return array
      */
     protected function returnMultipleValues(array $values, $flags)
@@ -1298,5 +1338,16 @@ class Memcached
         }
 
         return $ret;
+    }
+    
+    /**
+     * Initialize username and password class members
+     * @param string $username
+     * @param string $password
+     */
+    protected function setCredentials($username, $password)
+    {
+        $this->username = $username;
+        $this->password = $password;
     }
 }
